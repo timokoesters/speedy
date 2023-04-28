@@ -1,9 +1,7 @@
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use console_engine::screen::Screen;
-use console_engine::{pixel::pxl, KeyCode};
+use console_engine::KeyCode;
 use signal_hook::{consts::SIGUSR1, iterator::Signals};
 
 struct App {
