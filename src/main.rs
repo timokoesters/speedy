@@ -37,29 +37,6 @@ struct App {
 }
 
 impl App {
-    fn load_portal() -> Self {
-        let sections = vec![
-            "1", "3", "5", "7", "9", "10", "12", "13", "14", "15", "16", "17", "18", "19", "e0",
-            "e1", "e2",
-        ];
-
-        App {
-            game: "portal".to_owned(),
-            sections: sections
-                .iter()
-                .map(|&s| Section {
-                    name: s.to_owned(),
-                    pb_total: None,
-                    current_total: None,
-                })
-                .collect(),
-            current_section: 0,
-            start_time: Instant::now(), // This is not the actual start, it will be reset later
-            start_date: chrono::Local::now(), // This is not the actual start, it will be reset later
-            running: false,
-        }
-    }
-
     fn update_current_time(&mut self) {
         if !self.running {
             return;
@@ -80,7 +57,7 @@ impl App {
 
     fn pb_total_time(&self, section: usize) -> String {
         let s = &self.sections[section];
-        self.fixed_time_to_string(section, s.pb_total)
+        self.fixed_time_to_string(s.pb_total)
     }
 
     fn current_section_time(&self, section: usize) -> String {
@@ -100,7 +77,7 @@ impl App {
         self.time_to_string(section, time)
     }
 
-    fn pb_section_time(&self, section: usize) -> String {
+    fn _pb_section_time(&self, section: usize) -> String {
         if section == 0 {
             return self.pb_total_time(section);
         }
@@ -114,7 +91,7 @@ impl App {
             None
         };
 
-        self.fixed_time_to_string(section, time)
+        self.fixed_time_to_string(time)
     }
 
     fn delta_total_time(&self, section: usize) -> Option<i32> {
@@ -162,7 +139,7 @@ impl App {
         }
     }
 
-    fn fixed_time_to_string(&self, section: usize, time: Option<u32>) -> String {
+    fn fixed_time_to_string(&self, time: Option<u32>) -> String {
         if let Some(t) = time {
             format!("{:>2}:{:02}", t / 60000, (t / 1000) % 60)
         } else {
