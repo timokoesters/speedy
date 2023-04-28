@@ -1,9 +1,10 @@
 Speedy is a speedrun timer.
 
 Features:
-- Global hotkey: Use your desktop environment to send a SIGUSR1 signal to speedy (`killall -USR1 speedy`)
+- Global split hotkey: Use your desktop environment to send a SIGUSR1 signal to speedy (`killall -USR1 speedy`)
 - Automatic saving: Completed runs are saved in a data directory, usually `~/.local/share/speedy/`
 - Race against your personal best: The personal best is saved in a pb.ron file automatically.
+- Audio confirmations: Plays a sound when the run starts, when you split and when the run ended
 
 ---
 
