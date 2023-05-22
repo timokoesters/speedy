@@ -2,7 +2,10 @@ use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use console_engine::crossterm::terminal;
 use console_engine::pixel::pxl_bg;
-use std::fs::File;
+use regex::Regex;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -43,36 +46,36 @@ const BG: Color = Color::Rgb {
     b: 0x09,
 };
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct GameConfig {
+    version: u32,
+
+    #[serde(skip)]
+    directory_name: String,
+
+    full_game_name: String,
+    bridge_script: Option<PathBuf>,
+    sections: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Section {
     name: String,
-    #[serde(skip_serializing, rename(deserialize = "time"))]
-    pb_total: Option<u32>,
-    #[serde(skip)]
-    sum_of_best_total: Option<u32>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        skip_deserializing,
-        rename(serialize = "time")
-    )]
-    current_total: Option<u32>,
+    time: u32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct App {
-    game: String,
-    sections: Vec<Section>,
-    #[serde(skip)]
-    current_section: usize,
-    #[serde(skip, default = "Instant::now")]
+#[derive(Debug, Clone)]
+struct RunApp {
+    config: GameConfig,
+    current_sections: Vec<Section>,
+    pb_sections: Option<Vec<Section>>,
+    sum_of_best_sections: Option<Vec<Section>>,
     start_time: Instant,
-    #[serde(skip, default = "chrono::Local::now")]
     start_date: chrono::DateTime<chrono::Local>,
-    #[serde(skip)]
     running: bool,
 }
 
-impl App {
+impl RunApp {
     fn handle_signal(app: &RwLock<Self>, sink: &Sink, sig: i32) -> Result<()> {
         if sig != SIGUSR1 {
             return Ok(());
@@ -80,15 +83,13 @@ impl App {
 
         let app = &mut app.write().expect("RwLock not poisoned");
 
-        if app.current_section >= app.sections.len() {
-            return Ok(());
-        }
-
-        if app.running == false {
+        if !app.running && app.current_sections.len() == 0 {
             app.running = true;
             app.start_time = Instant::now();
             app.start_date = chrono::Local::now();
-            app.current_section = 0;
+
+            let name = app.config.sections[0].clone();
+            app.current_sections.push(Section { name, time: 0 });
 
             let source = SineWave::new(1.5 * 440.0)
                 .take_duration(Duration::from_secs_f32(0.1))
@@ -98,17 +99,19 @@ impl App {
             return Ok(());
         }
 
+        if !app.running {
+            return Ok(());
+        }
+
+        app.update_current_time();
+
         let source = SineWave::new(440.0)
             .take_duration(Duration::from_secs_f32(0.1))
             .amplify(0.20);
         sink.append(source.clone());
 
-        let current_section = app.current_section;
-        app.sections[current_section].current_total =
-            Some(app.start_time.elapsed().as_millis() as u32);
-        app.current_section += 1;
-
-        if app.current_section >= app.sections.len() {
+        if app.current_sections.len() >= app.config.sections.len() {
+            app.running = false;
             // Run finished
             app.save()?;
 
@@ -120,12 +123,20 @@ impl App {
             return Ok(());
         }
 
+        let name = app.config.sections[app.current_sections.len()].clone();
+        let time = app.start_time.elapsed().as_millis() as u32;
+        app.current_sections.push(Section { name, time });
+
         Ok(())
     }
+
     fn spawn_signal_handler(app: Arc<RwLock<Self>>) -> Result<()> {
         let mut signals = Signals::new(&[SIGUSR1])?;
-        let (_stream, audio_stream_handle) = rodio::OutputStream::try_default()?;
+        let (stream, audio_stream_handle) = rodio::OutputStream::try_default()?;
         let sink = Sink::try_new(&audio_stream_handle)?;
+
+        // Keep stream alive forever
+        Box::leak(Box::new(stream));
 
         std::thread::spawn(move || {
             for sig in signals.forever() {
@@ -141,7 +152,7 @@ impl App {
     fn launch_ui(app: &RwLock<Self>) -> Result<()> {
         let size = terminal::size()?;
         ensure!(size.0 >= 49);
-        ensure!(size.1 >= app.read().unwrap().sections.len() as u16 + 3);
+        ensure!(size.1 >= app.read().unwrap().config.sections.len() as u16 + 3);
         let mut engine = ConsoleEngine::init(size.0 as u32, size.1 as u32, 10)?;
         loop {
             engine.wait_frame();
@@ -150,7 +161,13 @@ impl App {
             let app = &mut app.write().expect("RwLock not poisoned");
             app.update_current_time();
 
-            engine.print_fbg(0, 0, &format!(" speedy: {}", app.game), FG, BG);
+            engine.print_fbg(
+                0,
+                0,
+                &format!(" speedy: {}", app.config.full_game_name),
+                FG,
+                BG,
+            );
             engine.print_fbg(
                 0,
                 1,
@@ -165,7 +182,7 @@ impl App {
                 FG,
                 BG,
             );
-            for (i, s) in app.sections.iter().enumerate() {
+            for (i, section_name) in app.config.sections.iter().enumerate() {
                 //01234567890123456789012345678901234567890123456
                 // section | best  | current       | section
                 // --------|-------|---------------|--------------
@@ -179,7 +196,7 @@ impl App {
 
                 let y = i as i32 + 3;
 
-                engine.print_fbg(name_x, y, &s.name, FG, BG);
+                engine.print_fbg(name_x, y, &section_name, FG, BG);
                 engine.print_fbg(best_x - 2, y, "|", FG, BG);
                 engine.print_fbg(best_x, y, &app.pb_total_time(i), FG, BG);
                 engine.print_fbg(total_x - 2, y, "|", FG, BG);
@@ -206,12 +223,12 @@ impl App {
             return;
         }
 
-        if self.current_section >= self.sections.len() {
+        if self.current_sections.len() > self.config.sections.len() {
             return;
         }
 
-        self.sections[self.current_section].current_total =
-            Some(self.start_time.elapsed().as_millis() as u32);
+        self.current_sections.last_mut().unwrap().time =
+            self.start_time.elapsed().as_millis() as u32;
     }
 
     fn current_total_time(
@@ -221,16 +238,19 @@ impl App {
         x: i32,
         y: i32,
     ) -> Result<()> {
-        if let Some(s) = self.sections[section].current_total {
-            engine.print_fbg(x, y, &self.time_to_string(0, Some(s)), FG, BG);
+        if let Some(s) = self.current_sections.get(section) {
+            engine.print_fbg(x, y, &self.time_to_string(0, Some(s.time)), FG, BG);
             return Ok(());
         }
 
-        if let Some(s) = self.sections[section].sum_of_best_total {
+        if let Some(s) = &self.sum_of_best_sections {
             engine.print_fbg(
                 x,
                 y,
-                &self.time_to_string(0, Some((s as i32 + self.loss_so_far()) as u32)),
+                &self.time_to_string(
+                    0,
+                    Some((s[section].time as i32 + self.loss_so_far()) as u32),
+                ),
                 GREY,
                 BG,
             );
@@ -241,8 +261,7 @@ impl App {
     }
 
     fn pb_total_time(&self, section: usize) -> String {
-        let s = &self.sections[section];
-        self.fixed_time_to_string(s.pb_total)
+        self.fixed_time_to_string(self.pb_sections.as_ref().map(|s| s[section].time))
     }
 
     fn current_section_time(
@@ -252,30 +271,32 @@ impl App {
         x: i32,
         y: i32,
     ) -> Result<()> {
-        let s = &self.sections[section];
-        let last = if section > 0 {
-            Some(&self.sections[section - 1])
+        let sob_section;
+        if let Some(sum_of_best_sections) = &self.sum_of_best_sections {
+            if section == 0 {
+                sob_section = Some(sum_of_best_sections[section].time);
+            } else {
+                sob_section = Some(
+                    sum_of_best_sections[section].time - sum_of_best_sections[section - 1].time,
+                );
+            }
         } else {
-            None
-        };
-
-        let sum_of_best_section;
-        if let (Some(c), Some(l)) = (
-            s.sum_of_best_total,
-            last.map_or(Some(0), |l| l.sum_of_best_total),
-        ) {
-            sum_of_best_section = Some(c - l);
-        } else {
-            sum_of_best_section = None;
+            sob_section = None;
         }
 
-        if let (Some(c), Some(l)) = (s.current_total, last.map_or(Some(0), |l| l.current_total)) {
-            let time = c - l;
+        if let Some(c) = self.current_sections.get(section).map(|s| s.time) {
+            let last_time;
+            if section == 0 {
+                last_time = 0;
+            } else {
+                last_time = self.current_sections[section - 1].time
+            }
+            let time = c - last_time;
             engine.print_fbg(
                 x,
                 y,
                 &self.time_to_string(section, Some(time)),
-                if section < self.current_section && Some(time) < sum_of_best_section {
+                if section < self.current_sections.len() - 1 && Some(time) < sob_section {
                     GOLD
                 } else {
                     FG
@@ -285,7 +306,7 @@ impl App {
             return Ok(());
         }
 
-        if let Some(s) = sum_of_best_section {
+        if let Some(s) = sob_section {
             engine.print_fbg(x, y, &self.time_to_string(0, Some(s)), GREY, BG);
             return Ok(());
         }
@@ -294,41 +315,29 @@ impl App {
         Ok(())
     }
 
-    fn _pb_section_time(&self, section: usize) -> String {
-        if section == 0 {
-            return self.pb_total_time(section);
-        }
-
-        let s = &self.sections[section];
-        let last = &self.sections[section - 1];
-
-        let time = if let (Some(c), Some(l)) = (s.pb_total, last.pb_total) {
-            Some(c - l)
-        } else {
-            None
-        };
-
-        self.fixed_time_to_string(time)
-    }
-
     fn last_loss(&self) -> i32 {
-        if self.current_section == 0 {
+        if self.current_sections.len() == 0 {
             return 0;
-        } else if let (Some(l_c), Some(last_sob)) = (
-            self.sections[self.current_section - 1].current_total,
-            self.sections[self.current_section - 1].sum_of_best_total,
-        ) {
-            return l_c as i32 - last_sob as i32;
         }
 
-        0
+        let current = self.current_sections[self.current_sections.len() - 1].time;
+        if let Some(sum_of_best_sections) = &self.sum_of_best_sections {
+            let sob = sum_of_best_sections[self.current_sections.len() - 1].time;
+
+            return current as i32 - sob as i32;
+        }
+
+        return 0;
     }
 
     fn loss_so_far(&self) -> i32 {
-        if let (Some(c), Some(s_c)) = (
-            self.sections[self.current_section].current_total,
-            self.sections[self.current_section].sum_of_best_total,
-        ) {
+        if self.current_sections.len() == 0 {
+            return 0;
+        }
+
+        if let Some(sum_of_best_sections) = &self.sum_of_best_sections {
+            let c = self.current_sections.last().unwrap().time;
+            let s_c = sum_of_best_sections[self.current_sections.len() - 1].time;
             let last_loss = self.last_loss();
             if c > (s_c as i32 + last_loss) as u32 {
                 return c as i32 - s_c as i32;
@@ -346,14 +355,16 @@ impl App {
         x: i32,
         y: i32,
     ) -> Result<()> {
-        let s = &self.sections[section];
+        if let (Some(c), Some(pb_sections)) =
+            (self.current_sections.get(section), &self.pb_sections)
+        {
+            let p = &pb_sections[section];
+            let delta = c.time as i32 - p.time as i32;
 
-        if let (Some(p), Some(c)) = (s.pb_total, s.current_total) {
-            let delta = c as i32 - p as i32;
-
-            if section == self.current_section {
-                if let Some(s_c) = s.sum_of_best_total {
-                    if c < (s_c as i32 + self.loss_so_far()) as u32 {
+            if section == self.current_sections.len() - 1 {
+                if let Some(sum_of_best_sections) = &self.sum_of_best_sections {
+                    let s_c = sum_of_best_sections[section].time;
+                    if c.time < (s_c as i32 + self.loss_so_far()) as u32 {
                         engine.print_fbg(
                             x,
                             y,
@@ -392,29 +403,38 @@ impl App {
         x: i32,
         y: i32,
     ) -> Result<()> {
-        let s = &self.sections[section];
+        if self.current_sections.len() < section + 1 {
+            // Print nothing
+            return Ok(());
+        }
 
-        let last = if section > 0 {
-            Some(&self.sections[section - 1])
-        } else {
-            None
-        };
+        if let Some(pb_sections) = &self.pb_sections {
+            let pb_c = pb_sections[section].time;
+            let pb_l = if section == 0 {
+                0
+            } else {
+                pb_sections[section].time
+            };
+            let c_c = self.current_sections[section].time;
+            let c_l = if section == 0 {
+                0
+            } else {
+                self.current_sections[section - 1].time
+            };
 
-        if let (Some(pb_c), Some(pb_l), Some(c_c), Some(c_l)) = (
-            s.pb_total,
-            last.map_or(Some(0), |l| l.pb_total),
-            s.current_total,
-            last.map_or(Some(0), |l| l.current_total),
-        ) {
             let section_time = c_c - c_l;
             let pb_section_time = pb_c - pb_l;
             let delta = section_time as i32 - pb_section_time as i32;
 
-            if section == self.current_section {
-                if let (Some(s_c), Some(s_l)) = (
-                    s.sum_of_best_total,
-                    last.map_or(Some(0), |l| l.sum_of_best_total),
-                ) {
+            if section == self.current_sections.len() - 1 {
+                if let Some(sum_of_best_sections) = &self.sum_of_best_sections {
+                    let s_c = sum_of_best_sections[section].time;
+                    let s_l = if section == 0 {
+                        0
+                    } else {
+                        sum_of_best_sections[section - 1].time
+                    };
+
                     let sum_of_best_time = s_c - s_l;
                     if section_time < sum_of_best_time {
                         engine.print_fbg(
@@ -449,7 +469,7 @@ impl App {
         if let Some(t) = time {
             format!("{:>2}:{:02}", t / 60000, (t / 1000) % 60)
         } else {
-            if section < self.current_section {
+            if section < self.current_sections.len() - 1 {
                 "--:--".to_owned()
             } else {
                 "     ".to_owned()
@@ -474,7 +494,7 @@ impl App {
                 format!("(+{}:{:02})", t / 60000, (t / 1000) % 60)
             }
         } else {
-            if section < self.current_section {
+            if section < self.current_sections.len() - 1 {
                 "(--:--)".to_owned()
             } else {
                 "       ".to_owned()
@@ -482,86 +502,225 @@ impl App {
         }
     }
 
-    fn load_default(game: &str) -> Result<Self> {
-        let dirs = directories::ProjectDirs::from("", "", "speedy")
-            .ok_or(anyhow!("No home directory found"))?;
-        let data_dir = dirs.data_dir();
-        let game_dir = data_dir.join(&game);
-        let pb_file_path = game_dir.join("pb.ron");
-        let pb_file = File::open(pb_file_path).context("Failed to open pb file")?;
+    fn prepare_run(config: GameConfig) -> Result<Self> {
+        let sum_of_best = load_run(&config.directory_name, "sum_of_best.run")?;
 
-        let sum_of_best_file_path = game_dir.join("sum_of_best.ron");
-        let sum_of_best_file = File::open(sum_of_best_file_path);
-
-        let mut app: Self = ron::de::from_reader(pb_file)?;
-        if let Ok(sum_of_best_file) = sum_of_best_file {
-            let sum_of_best: Self = ron::de::from_reader(sum_of_best_file)?;
-
-            ensure!(sum_of_best.sections.len() == app.sections.len());
-            for i in 0..app.sections.len() {
-                ensure!(sum_of_best.sections[i].name == app.sections[i].name);
-                app.sections[i].sum_of_best_total = sum_of_best.sections[i].pb_total;
+        if let Some(sum_of_best) = &sum_of_best {
+            ensure!(config.sections.len() == sum_of_best.len());
+            for i in 0..config.sections.len() {
+                ensure!(config.sections[i] == sum_of_best[i].name);
             }
         }
-        Ok(app)
+
+        Ok(Self {
+            config,
+            current_sections: Vec::new(),
+            pb_sections: None,
+            sum_of_best_sections: sum_of_best,
+            start_time: Instant::now(),
+            start_date: chrono::Local::now(),
+            running: false,
+        })
     }
 
-    fn save(&self) -> Result<()> {
-        let dirs = directories::ProjectDirs::from("", "", "speedy")
-            .ok_or(anyhow!("No home directory found"))?;
-        let data_dir = dirs.data_dir();
-        let game_dir = data_dir.join(&self.game);
-        std::fs::create_dir_all(&game_dir)?;
-        let name = self.start_date.format("%Y-%m-%dT%H:%M:%S.ron").to_string();
-        let file_path = game_dir.join(name);
-        let file = File::create(file_path)?;
-        ron::ser::to_writer_pretty(file, self, ron::ser::PrettyConfig::default())?;
-
-        let s = self.sections.last().ok_or(anyhow!(""))?;
-        let new_pb = match (s.pb_total, s.current_total) {
-            (Some(p), Some(c)) => c < p,
-            (None, Some(_)) => true,
-            _ => false,
-        };
-
-        if new_pb {
-            let pb_file_path = game_dir.join("pb.ron");
-            let pb_file = File::create(pb_file_path)?;
-            ron::ser::to_writer_pretty(pb_file, self, ron::ser::PrettyConfig::default())?;
+    fn set_pb(&mut self, pb: Vec<Section>) -> Result<()> {
+        ensure!(self.config.sections.len() == pb.len());
+        for i in 0..self.config.sections.len() {
+            ensure!(self.config.sections[i] == pb[i].name);
         }
 
-        let mut app_clone = self.clone();
-        let mut new_sum_of_best = 0;
-        for i in 0..self.sections.len() {
-            let mut section_time = self.sections[i]
-                .current_total
-                .expect("we just did a full run");
-            let mut sob_time = self.sections[i].sum_of_best_total;
-            if i > 0 {
-                section_time -= self.sections[i - 1]
-                    .current_total
-                    .expect("we just did a full run");
-                sob_time = sob_time.map(|sob| {
-                    sob - self.sections[i - 1]
-                        .sum_of_best_total
-                        .expect("sum of best is a full run")
-                });
-            }
-
-            if sob_time < Some(section_time) {
-                new_sum_of_best += sob_time.expect("comparison above worked");
-            } else {
-                new_sum_of_best += section_time;
-            }
-            app_clone.sections[i].current_total = Some(new_sum_of_best);
-        }
-
-        let sob_file_path = game_dir.join("sum_of_best.ron");
-        let sob_file = File::create(sob_file_path)?;
-        ron::ser::to_writer_pretty(sob_file, &app_clone, ron::ser::PrettyConfig::default())?;
+        self.pb_sections = Some(pb);
 
         Ok(())
     }
+
+    fn save(&self) -> Result<()> {
+        let name = self.start_date.format("%Y-%m-%dT%H:%M:%S.run").to_string();
+        save_run(&self.config.directory_name, &name, &self.current_sections)?;
+
+        let new_pb;
+        if let Some(pb) = &self.pb_sections {
+            ensure!(pb.len() == self.current_sections.len());
+            for i in 0..pb.len() {
+                ensure!(pb[i].name == self.current_sections[i].name);
+            }
+
+            new_pb = self
+                .current_sections
+                .last()
+                .context("empty current run")?
+                .time
+                < pb.last().context("empty pb run")?.time;
+        } else {
+            new_pb = true;
+        }
+
+        if new_pb {
+            save_run(
+                &self.config.directory_name,
+                "pb.run",
+                &self.current_sections,
+            )?;
+        }
+
+        let mut new_sob = Vec::new();
+        if let Some(sum_of_best_sections) = &self.sum_of_best_sections {
+            let mut new_sum_of_best = 0;
+            for i in 0..self.current_sections.len() {
+                let mut section_time = self.current_sections[i].time;
+                let mut sob_time = sum_of_best_sections[i].time;
+                if i > 0 {
+                    section_time -= self.current_sections[i - 1].time;
+                    sob_time -= sum_of_best_sections[i - 1].time;
+                }
+
+                if sob_time < section_time {
+                    new_sum_of_best += sob_time;
+                } else {
+                    new_sum_of_best += section_time;
+                }
+                new_sob.push(Section {
+                    name: self.current_sections[i].name.clone(),
+                    time: new_sum_of_best,
+                });
+            }
+        } else {
+            new_sob = self.current_sections.clone();
+        }
+
+        save_run(&self.config.directory_name, "sum_of_best.run", &new_sob)?;
+
+        Ok(())
+    }
+}
+
+fn min_sec_mil_to_millis(min: u32, sec: u32, mil: u32) -> u32 {
+    (min * 60 + sec) * 1000 + mil
+}
+
+fn millis_to_min_sec_mil(millis: u32) -> (u32, u32, u32) {
+    let min = millis / 60000;
+    let sec = (millis / 1000) % 60;
+    let mil = millis % 1000;
+    (min, sec, mil)
+}
+
+fn load_config(game: &str) -> Result<GameConfig> {
+    let dirs = directories::ProjectDirs::from("", "", "speedy")
+        .ok_or(anyhow!("No home directory found"))?;
+    let data_dir = dirs.data_dir();
+    let game_dir = data_dir.join(game);
+    let config_path = game_dir.join("config.toml");
+    let config_str = fs::read_to_string(config_path)?;
+    let mut config: GameConfig = toml::from_str(&config_str)?;
+    config.directory_name = game.to_owned();
+
+    ensure!(config.sections.len() > 0);
+
+    Ok(config)
+}
+
+fn load_all_configs() -> Result<Vec<GameConfig>> {
+    let dirs = directories::ProjectDirs::from("", "", "speedy")
+        .ok_or(anyhow!("No home directory found"))?;
+    let data_dir = dirs.data_dir();
+    let mut results = Vec::new();
+    for game_dir in fs::read_dir(&data_dir)? {
+        let game = game_dir?
+            .file_name()
+            .into_string()
+            .ok()
+            .context("Invalid OsString")?;
+        if let Ok(config) = load_config(&game) {
+            results.push(config);
+        }
+    }
+
+    Ok(results)
+}
+
+fn write_config(config: &GameConfig) -> Result<()> {
+    let dirs = directories::ProjectDirs::from("", "", "speedy")
+        .ok_or(anyhow!("No home directory found"))?;
+    let data_dir = dirs.data_dir();
+    let game_dir = data_dir.join(&config.directory_name);
+
+    std::fs::create_dir_all(&game_dir)?;
+
+    let config_str = toml::to_string_pretty(config)?;
+    let config_path = game_dir.join("config.toml");
+    fs::write(config_path, &config_str)?;
+
+    Ok(())
+}
+
+fn load_run(game: &str, run: &str) -> Result<Option<Vec<Section>>> {
+    let dirs = directories::ProjectDirs::from("", "", "speedy")
+        .ok_or(anyhow!("No home directory found"))?;
+    let data_dir = dirs.data_dir();
+    let game_dir = data_dir.join(&game);
+    let file_path = game_dir.join(run);
+
+    let file = if let Ok(file) = File::open(file_path) {
+        file
+    } else {
+        return Ok(None);
+    };
+
+    let file = BufReader::new(file);
+
+    let mut sections = Vec::new();
+    for line in file.lines() {
+        let line = line.context("Failed to read line in run file")?;
+
+        // Lines look like this: "escape01: 20m01.212s
+        let re = Regex::new(r"^(.*): (\d*)m(\d{2})\.(\d{3})s$").unwrap();
+        let cap = re.captures(&line).context("Invalid run file")?;
+
+        let section_name = cap[1].to_owned();
+        let section_time_ms = min_sec_mil_to_millis(
+            cap[2].parse().unwrap(),
+            cap[3].parse().unwrap(),
+            cap[4].parse().unwrap(),
+        );
+
+        sections.push(Section {
+            name: section_name,
+            time: section_time_ms,
+        });
+    }
+
+    Ok(Some(sections))
+}
+
+fn save_run(game: &str, run: &str, sections: &[Section]) -> Result<()> {
+    let dirs = directories::ProjectDirs::from("", "", "speedy")
+        .ok_or(anyhow!("No home directory found"))?;
+    let data_dir = dirs.data_dir();
+    let game_dir = data_dir.join(game);
+
+    let file_path = game_dir.join(run);
+    let mut file = BufWriter::new(File::create(file_path)?);
+
+    for section in sections {
+        let (min, sec, mil) = millis_to_min_sec_mil(section.time);
+        writeln!(file, "{}: {}m{:02}.{:03}s", section.name, min, sec, mil)?;
+    }
+
+    file.flush()?;
+
+    Ok(())
+}
+
+fn ask(q: &str) -> Result<String> {
+    print!("{}", q);
+
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    Ok(input.trim().to_owned())
 }
 
 #[derive(Parser, Debug)]
@@ -580,8 +739,11 @@ enum Mode {
     Against {
         enemy: Option<String>,
     },
-    Games,
-    List {
+    ListGames,
+    NewGame {
+        game: String,
+    },
+    ListRuns {
         game: String,
     },
     Show {
@@ -600,9 +762,81 @@ fn main() -> Result<()> {
 
     match args.mode {
         Mode::Run { game } => {
-            let app = Arc::new(RwLock::new(App::load_default(&game)?));
-            App::spawn_signal_handler(Arc::clone(&app))?;
-            App::launch_ui(&app)?;
+            let mut app = RunApp::prepare_run(load_config(&game)?)?;
+            if let Some(pb) = load_run(&game, "pb.run")? {
+                app.set_pb(pb)?;
+            }
+            let app = Arc::new(RwLock::new(app));
+            RunApp::spawn_signal_handler(Arc::clone(&app))?;
+            RunApp::launch_ui(&app)?;
+        }
+        Mode::NewGame { game } => {
+            println!("Registering new game");
+            let full_game_name = ask("Full game name: ")?;
+
+            println!("Enter section names (CTRL-D or write empty line to stop)");
+            let mut section_names = Vec::new();
+            for i in 1.. {
+                let name = ask(&format!("section{}: ", i))?;
+                if name.is_empty() {
+                    break;
+                }
+                section_names.push(name);
+            }
+            if section_names.is_empty() {
+                println!("\nGame creation cancelled");
+                return Ok(());
+            }
+
+            let bridge_script_raw = ask("\nOptional: Enter bridge script path: ")?;
+
+            let bridge_script = if bridge_script_raw.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(bridge_script_raw))
+            };
+
+            let ask_save = ask(&format!(
+                "Do you want to create {} with {} sections? [Y/n]: ",
+                game,
+                section_names.len()
+            ))?;
+
+            if ["y", "yes", "ja", "j", ""].contains(&&*ask_save.to_lowercase()) {
+                let config = GameConfig {
+                    version: 1,
+                    directory_name: game,
+                    full_game_name,
+                    bridge_script,
+                    sections: section_names,
+                };
+
+                write_config(&config)?;
+
+                println!("Done");
+            } else {
+                println!("Game creation cancelled");
+            }
+        }
+        Mode::ListGames => {
+            let configs = load_all_configs()?;
+            if configs.is_empty() {
+                println!("No games registered yet");
+            } else {
+                for config in configs {
+                    let pb = if let Some(pb_run) = load_run(&config.directory_name, "pb.run")? {
+                        let (min, sec, _mil) =
+                            millis_to_min_sec_mil(pb_run.last().context("Run is empty")?.time);
+                        format!("{}m{:02}s", min, sec)
+                    } else {
+                        "No PB!".to_owned()
+                    };
+                    println!(
+                        "{}: [{}] {}",
+                        pb, config.directory_name, config.full_game_name
+                    );
+                }
+            }
         }
         _ => {
             eprintln!("Mode is not implemented yet!");
