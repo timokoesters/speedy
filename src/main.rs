@@ -1,4 +1,4 @@
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use console_engine::crossterm::terminal;
 use console_engine::pixel::pxl_bg;
@@ -6,6 +6,7 @@ use regex::Regex;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -73,6 +74,7 @@ struct RunApp {
     start_time: Instant,
     start_date: chrono::DateTime<chrono::Local>,
     running: bool,
+    bridge_error: bool,
 }
 
 impl RunApp {
@@ -149,6 +151,20 @@ impl RunApp {
         Ok(())
     }
 
+    fn spawn_bridge_handler(app: Arc<RwLock<Self>>) -> Result<()> {
+        let script = app.read().unwrap().config.bridge_script.clone();
+        if let Some(script) = script {
+            std::thread::spawn(move || {
+                let mut command = Command::new(script);
+                let _ = command.output();
+
+                app.write().unwrap().bridge_error = true;
+            });
+        }
+
+        Ok(())
+    }
+
     fn launch_ui(app: &RwLock<Self>) -> Result<()> {
         let size = terminal::size()?;
         ensure!(size.0 >= 49);
@@ -156,11 +172,15 @@ impl RunApp {
         let mut engine = ConsoleEngine::init(size.0 as u32, size.1 as u32, 10)?;
         loop {
             engine.wait_frame();
-            engine.fill(pxl_bg(' ', BG));
 
             let app = &mut app.write().expect("RwLock not poisoned");
             app.update_current_time();
 
+            if app.bridge_error {
+                bail!("Bridge error!");
+            }
+
+            engine.fill(pxl_bg(' ', BG));
             engine.print_fbg(
                 0,
                 0,
@@ -316,13 +336,13 @@ impl RunApp {
     }
 
     fn last_loss(&self) -> i32 {
-        if self.current_sections.len() == 0 {
+        if self.current_sections.len() <= 1 {
             return 0;
         }
 
-        let current = self.current_sections[self.current_sections.len() - 1].time;
+        let current = self.current_sections[self.current_sections.len() - 2].time;
         if let Some(sum_of_best_sections) = &self.sum_of_best_sections {
-            let sob = sum_of_best_sections[self.current_sections.len() - 1].time;
+            let sob = sum_of_best_sections[self.current_sections.len() - 2].time;
 
             return current as i32 - sob as i32;
         }
@@ -413,7 +433,7 @@ impl RunApp {
             let pb_l = if section == 0 {
                 0
             } else {
-                pb_sections[section].time
+                pb_sections[section - 1].time
             };
             let c_c = self.current_sections[section].time;
             let c_l = if section == 0 {
@@ -520,6 +540,7 @@ impl RunApp {
             start_time: Instant::now(),
             start_date: chrono::Local::now(),
             running: false,
+            bridge_error: false,
         })
     }
 
@@ -763,11 +784,15 @@ fn main() -> Result<()> {
     match args.mode {
         Mode::Run { game } => {
             let mut app = RunApp::prepare_run(load_config(&game)?)?;
+
             if let Some(pb) = load_run(&game, "pb.run")? {
                 app.set_pb(pb)?;
             }
+
             let app = Arc::new(RwLock::new(app));
+
             RunApp::spawn_signal_handler(Arc::clone(&app))?;
+            RunApp::spawn_bridge_handler(Arc::clone(&app))?;
             RunApp::launch_ui(&app)?;
         }
         Mode::NewGame { game } => {
