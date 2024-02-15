@@ -2,11 +2,13 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use console_engine::crossterm::terminal;
 use console_engine::pixel::pxl_bg;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use regex::Regex;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -151,18 +153,17 @@ impl RunApp {
         Ok(())
     }
 
-    fn spawn_bridge_handler(app: Arc<RwLock<Self>>) -> Result<()> {
+    fn spawn_bridge_handler(app: Arc<RwLock<Self>>) -> Result<Option<Child>> {
         let script = app.read().unwrap().config.bridge_script.clone();
         if let Some(script) = script {
-            std::thread::spawn(move || {
-                let mut command = Command::new(script);
-                let _ = command.output();
-
-                app.write().unwrap().bridge_error = true;
-            });
+            let child = Command::new(script)
+                .stdout(std::io::stderr())
+                .spawn()
+                .unwrap();
+            return Ok(Some(child));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn launch_ui(app: &RwLock<Self>) -> Result<()> {
@@ -792,8 +793,12 @@ fn main() -> Result<()> {
             let app = Arc::new(RwLock::new(app));
 
             RunApp::spawn_signal_handler(Arc::clone(&app))?;
-            RunApp::spawn_bridge_handler(Arc::clone(&app))?;
+            let child = RunApp::spawn_bridge_handler(Arc::clone(&app))?;
+            // child.unwrap().stdout.unwrap();
             RunApp::launch_ui(&app)?;
+            if let Some(mut child) = child {
+                child.kill().unwrap();
+            }
         }
         Mode::NewGame { game } => {
             println!("Registering new game");

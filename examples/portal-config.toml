@@ -1,0 +1,23 @@
+version = 1
+full_game_name = "Portal"
+bridge_script = "/home/timo/Development/rust/speedy-bridges/speedy-portal-bridge/speedy-portal-bridge"
+sections = [
+    "1",
+    "3",
+    "5",
+    "7",
+    "8",
+    "9",
+    "10",
+    "12",
+    "13",
+    "14",
+    "15",
+    "16",
+    "17",
+    "18",
+    "19",
+    "e0",
+    "e1",
+    "e2",
+]
